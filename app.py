@@ -1,13 +1,12 @@
 """
-KEIKKAKONE v4 — Keikkasetti muusikoille
-- PDF näytetään iframe:ssa (ei tekstimuunnos)
-- Transponointi toimii tekstiextraktion kautta rinnalla
-- SessionStorage-muisti: tiedostot säilyvät selaimen välimuistissa
-- Korjattu HTML-renderöintiongelmat
+KEIKKAKONE v5 — Keikkasetti muusikoille
+- Isommat kortit ja fontit, yksinkertaisempi UI
+- PDF näytetään iframe:ssa blob URL:n kautta (st.html)
+- Transponointi tekstiextraktin kautta (PDF ei tue suoraan)
+- st.html käytössä (ei components.v1)
 """
 
 import streamlit as st
-import streamlit.components.v1 as components
 import json, re, os, io, logging, base64
 from difflib import SequenceMatcher
 
@@ -19,6 +18,7 @@ try:
 except ImportError:
     HAS_PDF = False
 
+
 # ──────────────────────────────────────────
 #  PDF helpers
 # ──────────────────────────────────────────
@@ -28,17 +28,12 @@ def pdf_to_text(file_bytes: bytes) -> str:
         return ""
     try:
         with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-            return "\n\n".join(
-                p.extract_text() or "" for p in pdf.pages
-            ).strip()
+            return "\n\n".join(p.extract_text() or "" for p in pdf.pages).strip()
     except Exception:
         return ""
 
 def bytes_to_b64(b: bytes) -> str:
     return base64.b64encode(b).decode("utf-8")
-
-def b64_to_bytes(s: str) -> bytes:
-    return base64.b64decode(s)
 
 
 # ──────────────────────────────────────────
@@ -55,7 +50,7 @@ def parse_setlist(text: str) -> list[dict]:
         if not cleaned:
             continue
         title, artist = cleaned, ""
-        for sep in [" - ", " – ", " / "]:
+        for sep in [" - ", " \u2013 ", " / "]:
             if sep in cleaned:
                 parts = cleaned.split(sep, 1)
                 title, artist = parts[0].strip(), parts[1].strip()
@@ -89,7 +84,7 @@ def _score(query: str, candidate: str) -> float:
         if ov > 0.5: return 0.7 + ov * 0.2
     return SequenceMatcher(None, q, c).ratio()
 
-def match_songs_to_pdfs(songs: list[dict], pdfs: list[dict]) -> list[dict]:
+def match_songs_to_pdfs(songs, pdfs):
     pool = list(pdfs)
     results = []
     for song in songs:
@@ -117,20 +112,16 @@ def match_songs_to_pdfs(songs: list[dict], pdfs: list[dict]) -> list[dict]:
 
 _SHARP = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
 _FLAT  = ["C","Db","D","Eb","E","F","Gb","G","Ab","A","Bb","B"]
-
 _CHORD_RE = re.compile(
-    r'\b([A-G])(#|b)?'
-    r'(m|min|maj|dim|aug|sus|add|dom)?'
-    r'(2|4|5|6|7|9|11|13)?'
-    r'((?:add|b|#|no|sus|maj|min|dim|aug|alt|\d)*)'
-    r'(/([A-G])(#|b)?)?'
+    r'\b([A-G])(#|b)?(m|min|maj|dim|aug|sus|add|dom)?(2|4|5|6|7|9|11|13)?'
+    r'((?:add|b|#|no|sus|maj|min|dim|aug|alt|\d)*)(/([A-G])(#|b)?)?'
     r'(?=\s|$|[)\]\-|:])'
 )
 
 def _ni(r, a=""):
     n = r + (a or "")
     if n in _SHARP: return _SHARP.index(n)
-    if n in _FLAT: return _FLAT.index(n)
+    if n in _FLAT:  return _FLAT.index(n)
     return {"Cb":11,"Fb":4,"E#":5,"B#":0}.get(n, -1)
 
 def _in(i, flat=False):
@@ -161,142 +152,23 @@ def transpose_text(text, semi, flat=False):
 
 
 # ──────────────────────────────────────────
-#  SessionStorage bridge (muisti selaimessa)
+#  Persistent state (/tmp)
 # ──────────────────────────────────────────
 
-def inject_storage_bridge():
-    """Injektoi JS-silta joka lataa/tallentaa datan sessionStorageen."""
-    components.html("""
-    <script>
-    // Tarkista onko dataa sessionStoragessa ja lähetä Streamlitille
-    const stored = sessionStorage.getItem('keikkakone_v4');
-    if (stored) {
-        // Streamlit ei suoraan ota JS-dataa, käytetään query param -temppua
-        // Tallennamme flagin jotta Python tietää datan olevan saatavilla
-        window.parent.postMessage({type: 'keikkakone_has_data', value: true}, '*');
-    }
-    </script>
-    """, height=0)
+_CACHE_FILE = "/tmp/keikkakone/session.json"
 
-def save_to_session_storage(data_b64: str):
-    """Tallenna data sessionStorageen."""
-    components.html(f"""
-    <script>
-    try {{
-        sessionStorage.setItem('keikkakone_v4', {json.dumps(data_b64)});
-    }} catch(e) {{
-        console.warn('SessionStorage full:', e);
-    }}
-    </script>
-    """, height=0)
-
-def render_pdf_viewer(pdf_b64: str, height: int = 700):
-    """Näytä PDF iframe:ssa blob URL:n kautta."""
-    components.html(f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-    <style>
-        body {{ margin: 0; padding: 0; background: #08080c; }}
-        iframe {{
-            width: 100%;
-            height: {height}px;
-            border: none;
-            border-radius: 12px;
-        }}
-        #loading {{
-            color: #e8572a;
-            font-family: 'DM Mono', monospace;
-            text-align: center;
-            padding: 2rem;
-            font-size: 0.9rem;
-            letter-spacing: 2px;
-        }}
-    </style>
-    </head>
-    <body>
-    <div id="loading">LADATAAN PDF...</div>
-    <script>
-    (function() {{
-        const b64 = {json.dumps(pdf_b64)};
-        const byteChars = atob(b64);
-        const byteNumbers = new Uint8Array(byteChars.length);
-        for (let i = 0; i < byteChars.length; i++) {{
-            byteNumbers[i] = byteChars.charCodeAt(i);
-        }}
-        const blob = new Blob([byteNumbers], {{ type: 'application/pdf' }});
-        const url = URL.createObjectURL(blob);
-        document.getElementById('loading').style.display = 'none';
-        const iframe = document.createElement('iframe');
-        iframe.src = url;
-        iframe.style.width = '100%';
-        iframe.style.height = '{height}px';
-        iframe.style.border = 'none';
-        iframe.style.borderRadius = '12px';
-        document.body.appendChild(iframe);
-    }})();
-    </script>
-    </body>
-    </html>
-    """, height=height + 10)
-
-
-# ──────────────────────────────────────────
-#  Render helpers
-# ──────────────────────────────────────────
-
-def render_chord_sheet(text: str, semi: int = 0, flat: bool = False,
-                       text_color: str = "#e4e4ec",
-                       chord_color: str = "#f0a830",
-                       chord_bg: str = "rgba(240,168,48,0.08)"):
-    t = transpose_text(text, semi, flat)
-    parts = []
-    for line in t.split("\n"):
-        esc = line.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
-        if not esc.strip():
-            parts.append('<div style="height:0.6em;"></div>')
-        elif is_chord_line(line):
-            parts.append(
-                f'<div style="color:{chord_color}; font-weight:500; '
-                f'font-size:1.05em; background:{chord_bg}; '
-                f'padding:1px 4px; border-radius:3px; '
-                f'margin:2px 0;">{esc}</div>'
-            )
-        else:
-            parts.append(f'<div style="color:{text_color}; font-size:1em;">{esc}</div>')
-
-    html = f"""
-    <div style="font-family:'DM Mono',monospace; line-height:1.75;
-                white-space:pre-wrap; word-break:break-word; padding:1rem 0;">
-        {"".join(parts)}
-    </div>
-    """
-    components.html(html, height=600, scrolling=True)
-
-
-# ──────────────────────────────────────────
-#  Persistent state (tiedostojärjestelmä)
-# ──────────────────────────────────────────
-
-# Streamlit Cloud: käytä /tmp koska /data ei välttämättä kirjoitettavissa
-_CACHE_DIR = "/tmp/keikkakone"
-_CACHE_FILE = os.path.join(_CACHE_DIR, "session.json")
-
-def _save_disk(data: dict):
-    """Tallenna metadata levylle (ei PDF-bytejä, ne session_statessa)."""
+def _save_disk():
     try:
-        os.makedirs(_CACHE_DIR, exist_ok=True)
-        # Tallennetaan vain metadata (ei binääridataa)
-        meta = {
-            "setlist": data.get("setlist", []),
-            "song_texts": data.get("song_texts", {}),
-            "transpose_settings": data.get("transpose_settings", {}),
-            "pdf_names": data.get("pdf_names", {}),
-        }
+        os.makedirs("/tmp/keikkakone", exist_ok=True)
         with open(_CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(meta, f, ensure_ascii=False)
-    except Exception as e:
-        pass  # Streamlit Cloud saattaa rajoittaa kirjoittamista
+            json.dump({
+                "setlist": st.session_state.get("setlist", []),
+                "song_texts": st.session_state.get("song_texts", {}),
+                "transpose_settings": st.session_state.get("transpose_settings", {}),
+                "pdf_names": st.session_state.get("pdf_names", {}),
+            }, f, ensure_ascii=False)
+    except Exception:
+        pass
 
 def _load_disk() -> dict:
     try:
@@ -307,71 +179,47 @@ def _load_disk() -> dict:
         pass
     return {}
 
-def _persist():
-    _save_disk({
-        "setlist": st.session_state.get("setlist", []),
-        "song_texts": st.session_state.get("song_texts", {}),
-        "transpose_settings": st.session_state.get("transpose_settings", {}),
-        "pdf_names": st.session_state.get("pdf_names", {}),
-    })
 
-
-# ══════════════════════════════════════════
-#  Streamlit page config
-# ══════════════════════════════════════════
+# ──────────────────────────────────────────
+#  Page config & init
+# ──────────────────────────────────────────
 
 st.set_page_config(
     page_title="KEIKKAKONE",
-    page_icon="♪",
+    page_icon="\u266a",
     layout="centered",
     initial_sidebar_state="collapsed",
 )
 
-# ──────────────────────────────────────────
-#  Init session state
-# ──────────────────────────────────────────
-
 if "init" not in st.session_state:
     d = _load_disk()
-    st.session_state.setlist = d.get("setlist", [])
-    st.session_state.song_texts = d.get("song_texts", {})
-    st.session_state.song_pdfs_b64 = {}  # title -> base64 PDF bytes
-    st.session_state.pdf_names = d.get("pdf_names", {})  # title -> original filename
+    st.session_state.setlist            = d.get("setlist", [])
+    st.session_state.song_texts         = d.get("song_texts", {})
+    st.session_state.song_pdfs_b64      = {}
+    st.session_state.pdf_names          = d.get("pdf_names", {})
     st.session_state.transpose_settings = d.get("transpose_settings", {})
-    st.session_state.open_song = None
-    st.session_state.view_mode = "pdf"  # "pdf" tai "text"
-    st.session_state.init = True
+    st.session_state.open_song          = None
+    st.session_state.view_mode          = "pdf"
+    st.session_state.init               = True
 
 
 # ──────────────────────────────────────────
-#  Theme (sidebar)
+#  Theme
 # ──────────────────────────────────────────
 
-dark = st.sidebar.toggle("Tumma teema", value=True, key="dark")
-st.sidebar.markdown("---")
-st.sidebar.markdown("**KEIKKAKONE v4**")
-st.sidebar.caption("PDF-näkymä + muisti")
-
+dark = st.sidebar.toggle("Tumma teema", value=True)
 if dark:
-    BG = "#08080c"
-    CARD = "#111118"
-    CARD_HOVER = "#1a1a24"
-    BORDER = "#222233"
-    TEXT = "#e4e4ec"
-    DIM = "#66667a"
-    ACCENT = "#e8572a"
-    CHORD_COLOR = "#f0a830"
-    CHORD_BG = "rgba(240,168,48,0.08)"
+    BG, CARD, BORDER = "#09090f", "#13131d", "#23233a"
+    TEXT, DIM        = "#eeeef5", "#5a5a72"
+    ACCENT           = "#e8572a"
+    CHORD            = "#f0a830"
+    CHORD_BG         = "rgba(240,168,48,0.10)"
 else:
-    BG = "#f7f5f0"
-    CARD = "#ffffff"
-    CARD_HOVER = "#faf8f4"
-    BORDER = "#e0ddd4"
-    TEXT = "#1a1a24"
-    DIM = "#777768"
-    ACCENT = "#c04420"
-    CHORD_COLOR = "#7a4012"
-    CHORD_BG = "rgba(122,64,18,0.06)"
+    BG, CARD, BORDER = "#f5f4ef", "#ffffff", "#dddbd0"
+    TEXT, DIM        = "#18181f", "#888870"
+    ACCENT           = "#c04420"
+    CHORD            = "#7a4012"
+    CHORD_BG         = "rgba(122,64,18,0.07)"
 
 
 # ──────────────────────────────────────────
@@ -380,235 +228,298 @@ else:
 
 st.markdown(f"""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:ital,wght@0,400;0,600;0,800;1,400&display=swap');
 
-.stApp {{ background: {BG} !important; }}
-.stApp, .stApp p, .stApp span, .stApp div, .stApp label {{ color: {TEXT}; }}
-
-.kk-header {{
-    text-align: center;
-    padding: 1.5rem 0 0.5rem;
-    user-select: none;
+html, body, .stApp {{
+    background: {BG} !important;
+    font-family: 'DM Sans', sans-serif;
 }}
-.kk-header h1 {{
+.stApp * {{ color: {TEXT}; }}
+
+.kk-title {{
     font-family: 'DM Mono', monospace;
-    font-size: 1.6rem;
+    font-size: 2rem;
     font-weight: 500;
     color: {ACCENT};
-    letter-spacing: 4px;
-    margin: 0;
+    letter-spacing: 6px;
+    text-align: center;
+    padding: 1.8rem 0 0.2rem;
 }}
-.kk-header .sub {{
+.kk-sub {{
     font-family: 'DM Sans', sans-serif;
-    font-size: 0.75rem;
+    font-size: 0.78rem;
     color: {DIM};
-    letter-spacing: 3px;
-    margin-top: 4px;
+    letter-spacing: 4px;
+    text-align: center;
+    margin-bottom: 0.5rem;
 }}
-.section-label {{
+
+/* ── Isot kortit ── */
+.stButton > button {{
+    width: 100%;
+    text-align: left !important;
+    background: {CARD} !important;
+    border: 1.5px solid {BORDER} !important;
+    border-radius: 18px !important;
+    padding: 22px 26px !important;
+    margin-bottom: 10px !important;
+    font-family: 'DM Sans', sans-serif !important;
+    font-size: 1.25rem !important;
+    font-weight: 600 !important;
+    color: {TEXT} !important;
+    line-height: 1.5 !important;
+    white-space: normal !important;
+    height: auto !important;
+    min-height: 80px !important;
+    transition: all 0.13s ease !important;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.08) !important;
+}}
+.stButton > button:hover {{
+    border-color: {ACCENT}77 !important;
+    box-shadow: 0 6px 20px rgba(0,0,0,0.14) !important;
+    transform: translateY(-2px);
+}}
+.stButton > button[kind="primary"] {{
+    background: {ACCENT} !important;
+    border-color: {ACCENT} !important;
+    color: #fff !important;
+    font-family: 'DM Mono', monospace !important;
+    letter-spacing: 2px !important;
+    font-size: 1rem !important;
+    min-height: 56px !important;
+    font-weight: 700 !important;
+}}
+.stButton > button[kind="secondary"] {{
+    min-height: 52px !important;
+    font-size: 1.05rem !important;
+}}
+
+.sec {{
     font-family: 'DM Mono', monospace;
     font-size: 0.68rem;
     color: {DIM};
     letter-spacing: 3px;
     text-transform: uppercase;
-    padding: 1.2rem 0 0.4rem;
-    user-select: none;
+    padding: 1rem 0 0.4rem;
 }}
-.count-badge {{
+.info {{
     font-family: 'DM Mono', monospace;
-    font-size: 0.75rem;
+    font-size: 0.8rem;
     color: {DIM};
     text-align: center;
-    padding: 0.4rem 0;
+    padding: 0.3rem 0 0.8rem;
+}}
+.num {{
+    font-family: 'DM Mono', monospace;
+    font-size: 1.1rem;
+    color: {ACCENT};
+    font-weight: 500;
 }}
 
-/* Song list item — pelkkä teksti, ei HTML-kortit */
-.stButton > button {{
-    width: 100%;
-    text-align: left;
-    background: {CARD} !important;
-    border: 1px solid {BORDER} !important;
-    border-radius: 14px !important;
-    padding: 16px 20px !important;
-    margin-bottom: 6px !important;
-    font-family: 'DM Sans', sans-serif !important;
-    font-size: 1rem !important;
-    color: {TEXT} !important;
-    transition: all 0.15s ease !important;
-    white-space: normal !important;
-    height: auto !important;
-    min-height: 60px !important;
-}}
-.stButton > button:hover {{
-    background: {CARD_HOVER} !important;
-    border-color: {ACCENT}55 !important;
-    transform: translateY(-1px);
-    box-shadow: 0 4px 16px rgba(0,0,0,0.12) !important;
-}}
-
-/* Primary button */
-.stButton > button[kind="primary"] {{
-    background: {ACCENT} !important;
-    border-color: {ACCENT} !important;
-    color: white !important;
-    font-weight: 600 !important;
-    letter-spacing: 1px !important;
-    font-family: 'DM Mono', monospace !important;
-}}
-
-#MainMenu {{visibility: hidden;}}
-footer {{visibility: hidden;}}
-header {{visibility: hidden;}}
-div[data-testid="stSidebar"] {{
-    background: {BG} !important;
-}}
+#MainMenu, footer, header {{ visibility: hidden; }}
+div[data-testid="stSidebar"] {{ background: {BG} !important; }}
 </style>
 """, unsafe_allow_html=True)
 
 
+# ──────────────────────────────────────────
+#  PDF iframe via st.html
+# ──────────────────────────────────────────
+
+def show_pdf(pdf_b64: str, height: int = 700):
+    # Split b64 into JS-safe chunks to avoid string literal limits
+    chunk = 50000
+    chunks = [pdf_b64[i:i+chunk] for i in range(0, len(pdf_b64), chunk)]
+    chunks_js = "[" + ",".join(f'"{c}"' for c in chunks) + "]"
+    html = f"""<!DOCTYPE html>
+<html><head><style>
+  body{{margin:0;background:{BG};}}
+  iframe{{width:100%;height:{height}px;border:none;border-radius:12px;display:block;}}
+  #msg{{color:{ACCENT};font-family:monospace;text-align:center;padding:2rem;
+        font-size:0.9rem;letter-spacing:2px;}}
+</style></head><body>
+<div id="msg">LADATAAN...</div>
+<script>
+(function(){{
+  var chunks={chunks_js};
+  var b64=chunks.join("");
+  var bin=atob(b64),arr=new Uint8Array(bin.length);
+  for(var i=0;i<bin.length;i++) arr[i]=bin.charCodeAt(i);
+  var url=URL.createObjectURL(new Blob([arr],{{type:"application/pdf"}}));
+  document.getElementById("msg").style.display="none";
+  var f=document.createElement("iframe");
+  f.src=url;
+  document.body.appendChild(f);
+}})();
+</script></body></html>"""
+    st.html(html)
+
+
+# ──────────────────────────────────────────
+#  Chord sheet via st.html
+# ──────────────────────────────────────────
+
+def show_chords(text: str, semi: int = 0, flat: bool = False):
+    t = transpose_text(text, semi, flat)
+    rows = []
+    for line in t.split("\n"):
+        esc = line.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+        if not esc.strip():
+            rows.append('<div style="height:0.55em"></div>')
+        elif is_chord_line(line):
+            rows.append(
+                f'<div style="color:{CHORD};font-weight:500;font-size:1.15em;'
+                f'background:{CHORD_BG};padding:2px 6px;border-radius:4px;margin:3px 0;">'
+                f'{esc}</div>'
+            )
+        else:
+            rows.append(f'<div style="color:{TEXT};font-size:1.05em;">{esc}</div>')
+
+    html = (
+        f'<div style="font-family:\'DM Mono\',monospace;line-height:1.8;'
+        f'white-space:pre-wrap;word-break:break-word;padding:0.5rem 0;">'
+        + "".join(rows) + "</div>"
+    )
+    st.html(html)
+
+
 # ══════════════════════════════════════════
-#  SONG DETAIL VIEW
+#  BIISI-DETALJINÄKYMÄ
 # ══════════════════════════════════════════
 
 if st.session_state.open_song is not None:
-    idx = st.session_state.open_song
+    idx     = st.session_state.open_song
     setlist = st.session_state.setlist
 
     if idx >= len(setlist):
         st.session_state.open_song = None
         st.rerun()
 
-    song = setlist[idx]
-    title = song["title"]
-    artist = song.get("artist", "")
-    text = st.session_state.song_texts.get(title, "")
+    song    = setlist[idx]
+    title   = song["title"]
+    artist  = song.get("artist", "")
+    text    = st.session_state.song_texts.get(title, "")
     pdf_b64 = st.session_state.song_pdfs_b64.get(title, "")
-    pdf_name = st.session_state.pdf_names.get(title, "")
-    ts = st.session_state.transpose_settings.get(title, {"semi": 0, "flat": False})
+    ts      = st.session_state.transpose_settings.get(title, {"semi":0,"flat":False})
 
-    # ── Back button
-    if st.button("← takaisin", key="back"):
+    # Takaisin
+    if st.button("\u2190 Takaisin", key="back", type="secondary"):
         st.session_state.open_song = None
         st.rerun()
 
-    # ── Title
-    num_str = f"{idx+1}."
+    # Otsikko
     st.markdown(
-        f'<div style="padding:0.3rem 0;">'
-        f'<span style="font-family:\'DM Mono\',monospace; font-size:1.1rem; '
-        f'color:{ACCENT};">{num_str}</span> '
-        f'<span style="font-family:\'DM Sans\',sans-serif; font-size:1.4rem; '
-        f'font-weight:700; color:{TEXT};">{title}</span>'
+        f'<div style="margin:0.5rem 0 0.1rem;">'
+        f'<span class="num">{idx+1}.</span> '
+        f'<span style="font-size:1.6rem;font-weight:800;">{title}</span>'
         f'</div>',
         unsafe_allow_html=True
     )
     if artist:
         st.markdown(
-            f'<div style="font-family:\'DM Sans\',sans-serif; font-size:0.85rem; '
-            f'color:{DIM}; padding-left:4px; margin-bottom:0.5rem;">{artist}</div>',
+            f'<div style="font-size:1rem;color:{DIM};margin-bottom:0.6rem;">'
+            f'{artist}</div>',
             unsafe_allow_html=True
         )
 
-    # ── View mode toggle (PDF / Teksti+Transponointi)
-    view_col1, view_col2 = st.columns(2)
-    with view_col1:
-        if st.button("📄 PDF-näkymä", key="vm_pdf",
-                     type="primary" if st.session_state.view_mode == "pdf" else "secondary"):
+    # View toggle
+    v1, v2 = st.columns(2)
+    with v1:
+        if st.button(
+            "\U0001f4c4 PDF", key="vm_pdf",
+            type="primary" if st.session_state.view_mode == "pdf" else "secondary",
+            use_container_width=True
+        ):
             st.session_state.view_mode = "pdf"
             st.rerun()
-    with view_col2:
-        if st.button("🎵 Transponointi", key="vm_text",
-                     type="primary" if st.session_state.view_mode == "text" else "secondary"):
+    with v2:
+        if st.button(
+            "\U0001f3b5 Transponointi", key="vm_text",
+            type="primary" if st.session_state.view_mode == "text" else "secondary",
+            use_container_width=True
+        ):
             st.session_state.view_mode = "text"
             st.rerun()
 
     st.markdown("---")
 
-    # ── PDF VIEW
+    # PDF-näkymä
     if st.session_state.view_mode == "pdf":
         if pdf_b64:
-            render_pdf_viewer(pdf_b64, height=680)
+            show_pdf(pdf_b64, height=680)
         elif text:
-            st.info("PDF ei saatavilla — näytetään tekstiversio")
-            st.text(text)
+            st.info("PDF ei saatavilla \u2014 n\u00e4ytet\u00e4\u00e4n teksti")
+            show_chords(text, ts.get("semi",0), ts.get("flat",False))
         else:
             st.markdown(
-                f'<div style="text-align:center; color:{DIM}; padding:3rem 0; '
-                f'font-family:\'DM Sans\',sans-serif;">Ei PDF-lappua tälle biisille</div>',
+                f'<div style="text-align:center;color:{DIM};padding:3rem 0;'
+                f'font-size:1.1rem;">Ei lappua t\u00e4lle biisille</div>',
                 unsafe_allow_html=True
             )
 
-    # ── TRANSPOSITION VIEW
+    # Transponointinäkymä
     else:
-        st.markdown('<div class="section-label">TRANSPONOINTI</div>', unsafe_allow_html=True)
+        semi = ts.get("semi", 0)
+        label = f"+{semi}" if semi > 0 else str(semi)
 
-        tc1, tc2, tc3, tc4, tc5 = st.columns([1, 1, 1, 1, 2])
-        with tc1:
-            if st.button("−", key="t_down"):
-                ts["semi"] = ts.get("semi", 0) - 1
+        c_down, c_val, c_up, c_flat, c_reset = st.columns([1,1,1,1,2])
+        with c_down:
+            if st.button("\u2212", key="t_down", use_container_width=True):
+                ts["semi"] = semi - 1
                 st.session_state.transpose_settings[title] = ts
-                _persist()
-                st.rerun()
-        with tc2:
-            semi = ts.get("semi", 0)
-            label = f"+{semi}" if semi > 0 else str(semi)
+                _save_disk(); st.rerun()
+        with c_val:
             st.markdown(
-                f'<div style="text-align:center; font-family:\'DM Mono\',monospace; '
-                f'font-size:1.4rem; color:{CHORD_COLOR}; font-weight:500; '
-                f'padding-top:4px;">{label}</div>',
+                f'<div style="text-align:center;font-family:\'DM Mono\',monospace;'
+                f'font-size:1.8rem;color:{CHORD};font-weight:500;padding-top:6px;">'
+                f'{label}</div>',
                 unsafe_allow_html=True
             )
-        with tc3:
-            if st.button("+", key="t_up"):
-                ts["semi"] = ts.get("semi", 0) + 1
+        with c_up:
+            if st.button("+", key="t_up", use_container_width=True):
+                ts["semi"] = semi + 1
                 st.session_state.transpose_settings[title] = ts
-                _persist()
-                st.rerun()
-        with tc4:
-            if st.button("♭/♯", key="t_flat"):
+                _save_disk(); st.rerun()
+        with c_flat:
+            flat_label = "\u266d" if ts.get("flat") else "\u266f"
+            if st.button(flat_label, key="t_flat", use_container_width=True):
                 ts["flat"] = not ts.get("flat", False)
                 st.session_state.transpose_settings[title] = ts
-                _persist()
-                st.rerun()
-        with tc5:
-            if ts.get("semi", 0) != 0:
-                if st.button("Nollaa", key="t_reset"):
+                _save_disk(); st.rerun()
+        with c_reset:
+            if semi != 0:
+                if st.button("Nollaa", key="t_reset", use_container_width=True):
                     ts["semi"] = 0
                     st.session_state.transpose_settings[title] = ts
-                    _persist()
-                    st.rerun()
+                    _save_disk(); st.rerun()
 
         st.markdown("---")
 
         if text:
-            render_chord_sheet(
-                text, ts.get("semi", 0), ts.get("flat", False),
-                text_color=TEXT, chord_color=CHORD_COLOR, chord_bg=CHORD_BG
-            )
+            show_chords(text, semi, ts.get("flat", False))
         else:
             st.markdown(
-                f'<div style="text-align:center; color:{DIM}; padding:3rem 0; '
-                f'font-family:\'DM Sans\',sans-serif;">'
-                f'Tekstiä ei saatu luettua PDF:stä.<br>'
-                f'<span style="font-size:0.8rem;">Kokeile PDF-näkymää.</span></div>',
+                f'<div style="text-align:center;color:{DIM};padding:2rem 0;">'
+                f'Teksti\u00e4 ei saatu luettua PDF:st\u00e4.<br>'
+                f'<span style="font-size:0.85rem;">Kokeile PDF-n\u00e4kym\u00e4\u00e4.</span></div>',
                 unsafe_allow_html=True
             )
 
-    # ── Prev / Next
+    # Edellinen / Seuraava
     st.markdown("---")
     cp, cn = st.columns(2)
     with cp:
         if idx > 0:
-            prev_title = setlist[idx-1]["title"]
-            short = prev_title[:20] + "…" if len(prev_title) > 20 else prev_title
-            if st.button(f"← {short}", key="prev", use_container_width=True):
+            prev = setlist[idx-1]["title"]
+            lbl  = ("\u2190 " + prev)[:28]
+            if st.button(lbl, key="prev", use_container_width=True, type="secondary"):
                 st.session_state.open_song = idx - 1
                 st.rerun()
     with cn:
         if idx < len(setlist) - 1:
-            next_title = setlist[idx+1]["title"]
-            short = next_title[:20] + "…" if len(next_title) > 20 else next_title
-            if st.button(f"{short} →", key="next", use_container_width=True):
+            nxt = setlist[idx+1]["title"]
+            lbl = (nxt + " \u2192")[:28]
+            if st.button(lbl, key="next", use_container_width=True, type="secondary"):
                 st.session_state.open_song = idx + 1
                 st.rerun()
 
@@ -616,223 +527,182 @@ if st.session_state.open_song is not None:
 
 
 # ══════════════════════════════════════════
-#  MAIN: Setlist view
+#  PÄÄNÄKYMÄ — Setlista
 # ══════════════════════════════════════════
 
-st.markdown("""
-<div class="kk-header">
-    <h1>KEIKKAKONE</h1>
-    <div class="sub">SETTILISTA</div>
-</div>
-""", unsafe_allow_html=True)
+st.markdown(f'<div class="kk-title">KEIKKAKONE</div>', unsafe_allow_html=True)
+st.markdown(f'<div class="kk-sub">SETTILISTA</div>', unsafe_allow_html=True)
 
-# ── Näytä muistin status
 setlist = st.session_state.setlist
+
+# Muississtatus
 if setlist:
-    n_pdf = sum(1 for s in setlist if st.session_state.song_pdfs_b64.get(s["title"]) or
+    n_pdf = sum(1 for s in setlist if
+                st.session_state.song_pdfs_b64.get(s["title"]) or
                 st.session_state.song_texts.get(s["title"]))
-    cols_top = st.columns([3, 1])
-    with cols_top[0]:
+    hcol1, hcol2 = st.columns([4, 1])
+    with hcol1:
         st.markdown(
-            f'<div style="font-family:\'DM Mono\',monospace; font-size:0.75rem; '
-            f'color:{DIM}; padding:0.5rem 0;">'
-            f'♪ {len(setlist)} biisiä muistissa · {n_pdf} lappua ladattu</div>',
+            f'<div style="font-family:\'DM Mono\',monospace;font-size:0.78rem;'
+            f'color:{DIM};padding:0.4rem 0;">'
+            f'\u266a {len(setlist)} bii\u00e4 \u00b7 {n_pdf} lappua</div>',
             unsafe_allow_html=True
         )
-    with cols_top[1]:
-        if st.button("🗑 Tyhjennä", key="clear_all"):
-            for key in ["setlist","song_texts","song_pdfs_b64","pdf_names",
-                        "transpose_settings","_pending_songs"]:
-                st.session_state[key] = [] if key in ["setlist"] else {}
-            _persist()
-            st.rerun()
+    with hcol2:
+        if st.button("\U0001f5d1", key="clear_all", help="Tyhjenn\u00e4 kaikki"):
+            for k in ["setlist","song_texts","song_pdfs_b64","pdf_names","transpose_settings"]:
+                st.session_state[k] = [] if k == "setlist" else {}
+            st.session_state._pending_songs = None
+            _save_disk(); st.rerun()
 
 st.markdown("---")
 
-# ──────────────────────────────────────────
-#  Upload: Biisilista
-# ──────────────────────────────────────────
-
-st.markdown('<div class="section-label">LATAA BIISILISTA</div>', unsafe_allow_html=True)
+# Lataa biisilista
+st.markdown('<div class="sec">LATAA BIISILISTA</div>', unsafe_allow_html=True)
 
 setlist_file = st.file_uploader(
-    "Biisilista (TXT tai PDF)",
-    type=["txt", "pdf"],
-    key="setlist_file",
-    label_visibility="collapsed"
+    "Biisilista (TXT tai PDF)", type=["txt","pdf"],
+    key="setlist_file", label_visibility="collapsed"
 )
 
 if setlist_file:
-    if setlist_file.type == "application/pdf":
-        raw_bytes = setlist_file.read()
-        raw_text = pdf_to_text(raw_bytes)
-    else:
-        raw_text = setlist_file.read().decode("utf-8", errors="replace")
+    raw = setlist_file.read()
+    raw_text = (pdf_to_text(raw) if setlist_file.type == "application/pdf"
+                else raw.decode("utf-8", errors="replace"))
     parsed = parse_setlist(raw_text)
     if parsed:
         st.session_state._pending_songs = parsed
-        st.success(f"✓ {len(parsed)} biisiä luettu")
+        st.success(f"\u2713 {len(parsed)} biisi\u00e4 luettu")
     else:
-        st.warning("Biisejä ei löytynyt. Muoto: Biisin nimi - Artisti")
+        st.warning("Biisej\u00e4 ei l\u00f6ytynyt. Muoto: Biisin nimi - Artisti")
 
-# ──────────────────────────────────────────
-#  Upload: PDF-laput + Matching
-# ──────────────────────────────────────────
-
+# Lataa PDF-laput
 if st.session_state.get("_pending_songs"):
     songs = st.session_state._pending_songs
-
-    st.markdown('<div class="section-label">LATAA PDF-SOINTULAPUT</div>', unsafe_allow_html=True)
-    st.caption("Valitse kaikki keikan PDF-laput kerralla.")
+    st.markdown('<div class="sec">LATAA PDF-SOINTULAPUT</div>', unsafe_allow_html=True)
 
     pdf_files = st.file_uploader(
-        "PDF-laput",
-        type=["pdf"],
-        accept_multiple_files=True,
-        key="pdf_upload",
-        label_visibility="collapsed"
+        "PDF-laput", type=["pdf"], accept_multiple_files=True,
+        key="pdf_upload", label_visibility="collapsed"
     )
 
     if pdf_files:
-        available = []
-        pdf_bytes_map = {}
+        available, pdf_bytes_map = [], {}
         for f in pdf_files:
-            b = f.read(); f.seek(0)
+            b = f.read()
             available.append({"name": f.name})
             pdf_bytes_map[f.name] = b
 
-        matched = match_songs_to_pdfs(songs, available)
-
-        st.markdown('<div class="section-label">YHDISTÄMINEN</div>', unsafe_allow_html=True)
-
-        all_names = ["—"] + [p["name"] for p in available]
+        matched   = match_songs_to_pdfs(songs, available)
+        all_names = ["\u2014"] + [p["name"] for p in available]
         final_matches = []
 
+        st.markdown('<div class="sec">YHDIST\u00c4MINEN</div>', unsafe_allow_html=True)
         for i, m in enumerate(matched):
             c1, c2 = st.columns([3, 3])
             with c1:
-                st.markdown(f"**{i+1}. {m['title']}**")
-                if m.get("artist"):
-                    st.caption(m["artist"])
+                st.markdown(
+                    f'<div style="font-size:1.05rem;font-weight:600;">'
+                    f'{i+1}. {m["title"]}</div>'
+                    + (f'<div style="font-size:0.85rem;color:{DIM};">'
+                       f'{m["artist"]}</div>' if m.get("artist") else ""),
+                    unsafe_allow_html=True
+                )
             with c2:
                 default = 0
                 if m["match"]:
-                    try:
-                        default = all_names.index(m["match"]["name"])
-                    except ValueError:
-                        default = 0
-                sel = st.selectbox(
-                    f"PDF #{i+1}",
-                    all_names,
-                    index=default,
-                    key=f"sel_{i}",
-                    label_visibility="collapsed"
-                )
+                    try: default = all_names.index(m["match"]["name"])
+                    except ValueError: pass
+                sel = st.selectbox("", all_names, index=default,
+                                   key=f"sel_{i}", label_visibility="collapsed")
                 final_matches.append(sel)
 
         st.markdown("---")
-        matched_count = sum(1 for f in final_matches if f != "—")
+        mc = sum(1 for f in final_matches if f != "\u2014")
         st.markdown(
-            f'<div class="count-badge">{matched_count}/{len(songs)} yhdistetty</div>',
+            f'<div class="info">{mc}/{len(songs)} yhdistetty</div>',
             unsafe_allow_html=True
         )
 
         if st.button("RAKENNA SETTI", type="primary", use_container_width=True):
-            new_setlist = []
-            new_texts = {}
-            new_pdfs_b64 = {}
-            new_pdf_names = {}
-
+            new_sl, new_texts, new_pdfs, new_names = [], {}, {}, {}
             for i, song in enumerate(songs):
-                pdf_name = final_matches[i] if i < len(final_matches) else "—"
-                title = song["title"]
-                new_setlist.append(song)
-
-                if pdf_name != "—" and pdf_name in pdf_bytes_map:
-                    raw = pdf_bytes_map[pdf_name]
-                    # Tallenna PDF base64:na
-                    new_pdfs_b64[title] = bytes_to_b64(raw)
-                    new_pdf_names[title] = pdf_name
-                    # Myös tekstiextrakti transponointia varten
-                    extracted = pdf_to_text(raw)
-                    new_texts[title] = extracted if extracted.strip() else ""
+                pname = final_matches[i] if i < len(final_matches) else "\u2014"
+                t = song["title"]
+                new_sl.append(song)
+                if pname != "\u2014" and pname in pdf_bytes_map:
+                    raw = pdf_bytes_map[pname]
+                    new_pdfs[t]  = bytes_to_b64(raw)
+                    new_names[t] = pname
+                    ext = pdf_to_text(raw)
+                    new_texts[t] = ext if ext.strip() else ""
                 else:
-                    new_texts[title] = ""
+                    new_texts[t] = ""
+            st.session_state.setlist            = new_sl
+            st.session_state.song_texts         = new_texts
+            st.session_state.song_pdfs_b64      = new_pdfs
+            st.session_state.pdf_names          = new_names
+            st.session_state._pending_songs     = None
+            _save_disk(); st.rerun()
 
-            st.session_state.setlist = new_setlist
-            st.session_state.song_texts = new_texts
-            st.session_state.song_pdfs_b64 = new_pdfs_b64
-            st.session_state.pdf_names = new_pdf_names
-            st.session_state._pending_songs = None
-            _persist()
-            st.rerun()
-
-# ──────────────────────────────────────────
-#  Setlist display
-# ──────────────────────────────────────────
-
+# Setlista — isot kortit
 setlist = st.session_state.setlist
 
 if setlist:
     st.markdown("---")
     st.markdown(
-        f'<div class="count-badge">{len(setlist)} biisiä</div>',
+        f'<div class="info">{len(setlist)} biisi\u00e4</div>',
         unsafe_allow_html=True
     )
 
     for i, song in enumerate(setlist):
-        title = song["title"]
-        artist = song.get("artist", "")
-        has_pdf = bool(st.session_state.song_pdfs_b64.get(title))
-        has_text = bool(st.session_state.song_texts.get(title, "").strip())
-        has_content = has_pdf or has_text
-        ts = st.session_state.transpose_settings.get(title, {})
+        title       = song["title"]
+        artist      = song.get("artist", "")
+        has_content = bool(
+            st.session_state.song_pdfs_b64.get(title) or
+            st.session_state.song_texts.get(title, "").strip()
+        )
+        ts   = st.session_state.transpose_settings.get(title, {})
         semi = ts.get("semi", 0)
+        t_ind = (f"  [{'+' if semi>0 else ''}{semi}]" if semi != 0 else "")
+        dot   = "\u25cf" if has_content else "\u25cb"
 
-        # Numero + status + transponointi indicator
-        t_ind = f" [{'+' if semi > 0 else ''}{semi}]" if semi != 0 else ""
-        status = "●" if has_content else "○"
-        artist_line = f"\n{artist}" if artist else ""
+        lbl = f"{i+1}.  {dot}  {title}{t_ind}"
+        if artist:
+            lbl += f"\n        {artist}"
 
-        btn_label = f"{i+1}.  {status}  {title}{t_ind}{artist_line}"
-
-        if st.button(btn_label, key=f"open_{i}", use_container_width=True):
+        if st.button(lbl, key=f"open_{i}", use_container_width=True):
             st.session_state.open_song = i
-            st.session_state.view_mode = "pdf" if has_pdf else "text"
+            st.session_state.view_mode = (
+                "pdf" if st.session_state.song_pdfs_b64.get(title) else "text"
+            )
             st.rerun()
 
 elif not st.session_state.get("_pending_songs"):
     st.markdown(f"""
-    <div style="text-align:center; padding:3rem 1rem; color:{DIM};
-                font-family:'DM Sans',sans-serif;">
-        <div style="font-size:2.5rem; margin-bottom:1rem;">♪</div>
-        <div style="font-size:1rem;">Lataa biisilista yllä aloittaaksesi</div>
-        <div style="font-size:0.8rem; margin-top:0.5rem; color:{DIM}88;">
-            TXT tai PDF · Biisin nimi - Artisti · rivi per biisi
+    <div style="text-align:center;padding:3rem 1rem;color:{DIM};">
+        <div style="font-size:3rem;margin-bottom:1rem;">\u266a</div>
+        <div style="font-size:1.1rem;">Lataa biisilista yll\u00e4</div>
+        <div style="font-size:0.85rem;margin-top:0.5rem;color:{DIM}88;">
+            TXT tai PDF \u00b7 Biisin nimi - Artisti \u00b7 rivi per biisi
         </div>
     </div>
     """, unsafe_allow_html=True)
 
-# ──────────────────────────────────────────
-#  Footer: lisää yksittäinen PDF jälkeenpäin
-# ──────────────────────────────────────────
-
+# Lisää yksittäinen lappu
 if setlist:
-    with st.expander("➕ Lisää / päivitä yksittäinen lappu"):
-        st.caption("Valitse biisi ja lataa sille uusi PDF")
-        song_names = [s["title"] for s in setlist]
-        chosen = st.selectbox("Biisi", song_names, key="add_single_song")
-        single_pdf = st.file_uploader(
-            "PDF", type=["pdf"], key="single_pdf_upload",
-            label_visibility="collapsed"
-        )
-        if single_pdf and chosen:
-            raw = single_pdf.read()
-            if st.button("Tallenna lappu", key="save_single"):
+    with st.expander("\u2795 Lis\u00e4\u00e4 / p\u00e4ivit\u00e4 yksitt\u00e4inen lappu"):
+        names  = [s["title"] for s in setlist]
+        chosen = st.selectbox("Biisi", names, key="add_single_song")
+        spdf   = st.file_uploader("PDF", type=["pdf"], key="single_pdf",
+                                  label_visibility="collapsed")
+        if spdf and chosen:
+            raw = spdf.read()
+            if st.button("Tallenna", key="save_single"):
                 st.session_state.song_pdfs_b64[chosen] = bytes_to_b64(raw)
-                st.session_state.pdf_names[chosen] = single_pdf.name
-                extracted = pdf_to_text(raw)
-                st.session_state.song_texts[chosen] = extracted if extracted.strip() else ""
-                _persist()
-                st.success(f"✓ {single_pdf.name} tallennettu biisille '{chosen}'")
+                st.session_state.pdf_names[chosen]     = spdf.name
+                ext = pdf_to_text(raw)
+                st.session_state.song_texts[chosen]    = ext if ext.strip() else ""
+                _save_disk()
+                st.success(f"\u2713 Tallennettu: {spdf.name}")
                 st.rerun()
