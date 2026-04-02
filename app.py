@@ -327,37 +327,15 @@ div[data-testid="stSidebar"] {{ background: {BG} !important; }}
 # ──────────────────────────────────────────
 
 def show_pdf(pdf_b64: str, height: int = 700):
-    # Split b64 into JS-safe chunks to avoid string literal limits
-    chunk = 50000
-    chunks = [pdf_b64[i:i+chunk] for i in range(0, len(pdf_b64), chunk)]
-    chunks_js = "[" + ",".join(f'"{c}"' for c in chunks) + "]"
+    # data URL approach - works in sandboxed iframes (no blob URL needed)
     html = f"""<!DOCTYPE html>
 <html><head><style>
-  body{{margin:0;background:{BG};}}
+  html,body{{margin:0;padding:0;height:100%;background:#09090f;}}
   iframe{{width:100%;height:{height}px;border:none;border-radius:12px;display:block;}}
-  #msg{{color:{ACCENT};font-family:monospace;text-align:center;padding:2rem;
-        font-size:0.9rem;letter-spacing:2px;}}
 </style></head><body>
-<div id="msg">LADATAAN...</div>
-<script>
-(function(){{
-  var chunks={chunks_js};
-  var b64=chunks.join("");
-  var bin=atob(b64),arr=new Uint8Array(bin.length);
-  for(var i=0;i<bin.length;i++) arr[i]=bin.charCodeAt(i);
-  var url=URL.createObjectURL(new Blob([arr],{{type:"application/pdf"}}));
-  document.getElementById("msg").style.display="none";
-  var f=document.createElement("iframe");
-  f.src=url;
-  document.body.appendChild(f);
-}})();
-</script></body></html>"""
+<iframe src="data:application/pdf;base64,{pdf_b64}"></iframe>
+</body></html>"""
     st.html(html)
-
-
-# ──────────────────────────────────────────
-#  Chord sheet via st.html
-# ──────────────────────────────────────────
 
 def show_chords(text: str, semi: int = 0, flat: bool = False):
     t = transpose_text(text, semi, flat)
@@ -613,7 +591,7 @@ if st.session_state.get("_pending_songs"):
                 if m["match"]:
                     try: default = all_names.index(m["match"]["name"])
                     except ValueError: pass
-                sel = st.selectbox("", all_names, index=default,
+                sel = st.selectbox(f"PDF biisille {i+1}", all_names, index=default,
                                    key=f"sel_{i}", label_visibility="collapsed")
                 final_matches.append(sel)
 
